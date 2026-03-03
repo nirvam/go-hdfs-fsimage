@@ -1,0 +1,24 @@
+# Binaries
+*.exe
+*.test
+*.prof
+
+# DuckDB & CSV Outputs
+*.duckdb
+*.duckdb.wal
+*.csv
+
+# Dependencies
+vendor/
+
+# OS/IDE
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# AI instructions
+PROJECT.md
+TODO.md
+
