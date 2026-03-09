@@ -20,10 +20,10 @@ const (
 )
 
 var (
-	// pool for byte buffers to avoid reallocating on every message
-	bytePool = sync.Pool{
+	// BytePool for byte buffers to avoid reallocating on every message
+	BytePool = sync.Pool{
 		New: func() interface{} {
-			return make([]byte, 1024*64) // 64KB initial buffer
+			return make([]byte, 1024*128) // 128KB initial buffer
 		},
 	}
 )
@@ -155,52 +155,67 @@ func UnmarshalDelimited(data []byte, msg proto.Message) error {
 	return proto.Unmarshal(data[n:n+int(length)], msg)
 }
 
-// ReadDelimited reads a delimited protobuf message from an io.Reader.
-func ReadDelimited(r io.Reader, msg proto.Message) error {
-	// 1. Read the varint length prefix
-	var buf [binary.MaxVarintLen64]byte
-	var length uint64
-	var n int
-
-	// Optimization: If r is a *bufio.Reader, we can use Peek
-	if br, ok := r.(*bufio.Reader); ok {
+// ReadDelimitedHeader reads the length prefix of a delimited protobuf message.
+func ReadDelimitedHeader(r io.Reader) (uint64, error) {
+	// Optimization: If r supports Peek/Discard
+	if br, ok := r.(interface {
+		Peek(int) ([]byte, error)
+		Discard(int) (int, error)
+	}); ok {
 		peek, err := br.Peek(binary.MaxVarintLen64)
 		if err != nil && err != io.EOF && len(peek) == 0 {
-			return err
+			return 0, err
 		}
-		var m int
-		length, m = protowire.ConsumeVarint(peek)
-		if m > 0 {
-			n = m
-			br.Discard(m)
+		length, n := protowire.ConsumeVarint(peek)
+		if n > 0 {
+			br.Discard(n)
+			return length, nil
 		}
 	}
 
-	if n == 0 {
-		// Fallback for non-buffered reader
+	// Fallback to ByteReader or Read(1)
+	if br, ok := r.(io.ByteReader); ok {
+		var buf [binary.MaxVarintLen64]byte
 		for i := 0; i < binary.MaxVarintLen64; i++ {
-			if _, err := r.Read(buf[i : i+1]); err != nil {
-				return err
+			b, err := br.ReadByte()
+			if err != nil {
+				return 0, err
 			}
-			var m int
-			length, m = protowire.ConsumeVarint(buf[:i+1])
+			buf[i] = b
+			length, m := protowire.ConsumeVarint(buf[:i+1])
 			if m > 0 {
-				n = m
-				break
+				return length, nil
 			}
 		}
 	}
 
-	if n == 0 {
-		return fmt.Errorf("failed to read varint")
+	var buf [binary.MaxVarintLen64]byte
+	for i := 0; i < binary.MaxVarintLen64; i++ {
+		if _, err := r.Read(buf[i : i+1]); err != nil {
+			return 0, err
+		}
+		length, m := protowire.ConsumeVarint(buf[:i+1])
+		if m > 0 {
+			return length, nil
+		}
+	}
+
+	return 0, fmt.Errorf("failed to read varint header")
+}
+
+// ReadDelimited reads a delimited protobuf message from an io.Reader.
+func ReadDelimited(r io.Reader, msg proto.Message) error {
+	length, err := ReadDelimitedHeader(r)
+	if err != nil {
+		return err
 	}
 
 	// 2. Read the message body using a pooled buffer
-	dataPtr := bytePool.Get().([]byte)
+	dataPtr := BytePool.Get().([]byte)
 	if uint64(len(dataPtr)) < length {
 		dataPtr = make([]byte, length)
 	}
-	defer bytePool.Put(dataPtr)
+	defer BytePool.Put(dataPtr)
 
 	if _, err := io.ReadFull(r, dataPtr[:length]); err != nil {
 		return err

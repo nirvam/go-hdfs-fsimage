@@ -32,16 +32,16 @@ func NewDuckDBExporter(path string) (*DuckDBExporter, error) {
 		CREATE TABLE IF NOT EXISTS inodes (
 			id UBIGINT,
 			path VARCHAR,
-			type VARCHAR,
+			type UTINYINT,
 			replication UINTEGER,
 			modification_time TIMESTAMP,
 			access_time TIMESTAMP,
 			preferred_block_size UBIGINT,
 			blocks_count INTEGER,
 			file_size UBIGINT,
-			permission VARCHAR,
-			user_name VARCHAR,
-			group_name VARCHAR
+			permission USMALLINT,
+			user_id UINTEGER,
+			group_id UINTEGER
 		)
 	`)
 	if err != nil {
@@ -60,20 +60,40 @@ func NewDuckDBExporter(path string) (*DuckDBExporter, error) {
 	return &DuckDBExporter{db: db, conn: con, appender: appender}, nil
 }
 
+func (e *DuckDBExporter) ExportStringTable(table map[uint32]string) error {
+	_, err := e.db.Exec(`CREATE TABLE IF NOT EXISTS string_table (id UINTEGER, value VARCHAR)`)
+	if err != nil {
+		return err
+	}
+
+	appender, err := duckdb.NewAppenderFromConn(e.conn, "", "string_table")
+	if err != nil {
+		return err
+	}
+	defer appender.Close()
+
+	for id, val := range table {
+		if err := appender.AppendRow(id, val); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (e *DuckDBExporter) Export(record *INodeRecord) error {
 	return e.appender.AppendRow(
 		record.ID,
 		record.Path,
-		record.Type,
+		record.RawType,
 		record.Replication,
 		record.ModificationTime,
 		record.AccessTime,
 		record.PreferredBlockSize,
 		int32(record.BlocksCount),
 		record.FileSize,
-		record.Permission,
-		record.UserName,
-		record.GroupName,
+		record.RawPermission,
+		record.UserID,
+		record.GroupID,
 	)
 }
 

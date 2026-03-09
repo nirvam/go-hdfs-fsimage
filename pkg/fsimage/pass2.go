@@ -1,32 +1,42 @@
 package fsimage
 
 import (
-	"strings"
+	"io"
+	"runtime"
 	"sync"
 	"time"
 
 	"github.com/nirvam/go-hdfs-fsimage/pkg/exporter"
 	"github.com/nirvam/go-hdfs-fsimage/pkg/fsimage/types"
-)
-
-var (
-	pathSlicePool = sync.Pool{
-		New: func() interface{} {
-			return make([]string, 0, 32)
-		},
-	}
+	"google.golang.org/protobuf/proto"
 )
 
 const (
 	RootInodeID = 16385
 )
 
-func (img *FSImage) RunPass2(ctx *Pass1Context, exp exporter.Exporter) error {
+type ProgressReporter interface {
+	Add(int) error
+	ChangeMax(int)
+}
+
+type inodeJob struct {
+	data []byte
+}
+
+func (img *FSImage) RunPass2(ctx *Pass1Context, exp exporter.Exporter, bar ProgressReporter) error {
 	r, err := img.OpenSection("INODE")
 	if err != nil {
 		return err
 	}
 	defer r.Close()
+
+	// Pre-allocate Cache based on number of directories found in Pass 1 to avoid rehashing
+	if len(ctx.IDToName) > 0 {
+		ctx.mu.Lock()
+		ctx.DirPathCache = make(map[uint64]string, len(ctx.IDToName))
+		ctx.mu.Unlock()
+	}
 
 	// Read header
 	header := &types.INodeSection{}
@@ -35,36 +45,136 @@ func (img *FSImage) RunPass2(ctx *Pass1Context, exp exporter.Exporter) error {
 	}
 
 	numINodes := header.GetNumInodes()
-	inode := &types.INodeSection_INode{}
-	for i := uint64(0); i < numINodes; i++ {
-		inode.Reset()
-		if err := ReadDelimited(r, inode); err != nil {
-			return err
-		}
-
-		record := exporter.InodeRecordPool.Get().(*exporter.INodeRecord)
-		record.Reset()
-		img.fillINodeRecord(ctx, record, inode)
-
-		if err := exp.Export(record); err != nil {
-			exporter.InodeRecordPool.Put(record)
-			return err
-		}
-		exporter.InodeRecordPool.Put(record)
+	if bar != nil {
+		bar.ChangeMax(int(numINodes))
 	}
 
-	return nil
+	numWorkers := runtime.NumCPU()
+	jobChan := make(chan *inodeJob, numWorkers*16)
+	resultChan := make(chan *exporter.INodeRecord, numWorkers*16)
+	errChan := make(chan error, numWorkers+2)
+
+	var wg sync.WaitGroup
+
+	// 1. Workers: Parallel Processing
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			localInode := &types.INodeSection_INode{}
+			for job := range jobChan {
+				localInode.Reset()
+				if err := proto.Unmarshal(job.data, localInode); err != nil {
+					errChan <- err
+					BytePool.Put(job.data)
+					return
+				}
+				BytePool.Put(job.data)
+
+				record := exporter.InodeRecordPool.Get().(*exporter.INodeRecord)
+				record.Reset()
+				img.fillINodeRecord(ctx, record, localInode)
+				resultChan <- record
+			}
+		}()
+	}
+
+	// 2. Exporter: Single-threaded Consumer (Required for most database appenders)
+	exportDone := make(chan struct{})
+	go func() {
+		defer close(exportDone)
+		var i uint64
+		for record := range resultChan {
+			if err := exp.Export(record); err != nil {
+				errChan <- err
+				exporter.InodeRecordPool.Put(record)
+				return
+			}
+			exporter.InodeRecordPool.Put(record)
+			i++
+			if bar != nil && i%10000 == 0 {
+				bar.Add(10000)
+			}
+			if i == numINodes {
+				if bar != nil && numINodes%10000 != 0 {
+					bar.Add(int(numINodes % 10000))
+				}
+			}
+		}
+	}()
+
+	// 3. Producer: Read and dispatch
+	var produceErr error
+	for i := uint64(0); i < numINodes; i++ {
+		length, err := ReadDelimitedHeader(r)
+		if err != nil {
+			produceErr = err
+			break
+		}
+
+		data := BytePool.Get().([]byte)
+		if uint64(len(data)) < length {
+			data = make([]byte, length)
+		}
+		if _, err := io.ReadFull(r, data[:length]); err != nil {
+			BytePool.Put(data)
+			produceErr = err
+			break
+		}
+
+		select {
+		case err := <-errChan:
+			return err
+		case jobChan <- &inodeJob{data: data[:length]}:
+		}
+	}
+
+	close(jobChan)
+	wg.Wait()
+	close(resultChan)
+	<-exportDone
+
+	if produceErr != nil {
+		return produceErr
+	}
+
+	select {
+	case err := <-errChan:
+		return err
+	default:
+		return nil
+	}
 }
 
 func (img *FSImage) fillINodeRecord(ctx *Pass1Context, record *exporter.INodeRecord, inode *types.INodeSection_INode) {
 	id := inode.GetId()
-	name := string(inode.GetName())
+	var name string
+	if inode.GetType() == types.INodeSection_INode_DIRECTORY {
+		name = ctx.IDToName[id]
+	} else {
+		name = string(inode.GetName())
+	}
 
 	record.ID = id
+	record.RawType = uint8(inode.GetType())
 	record.Type = inode.GetType().String()
 
-	// Calculate Path
-	record.Path = img.calculatePath(ctx, id, name)
+	// Calculate Path using parent cache
+	if id == RootInodeID {
+		record.Path = "/"
+	} else {
+		parentID := ctx.ChildToParent[id]
+		parentPath := img.getDirPath(ctx, parentID)
+		// For children of root, parentPath will be "", so we get "/name"
+		record.Path = parentPath + "/" + name
+	}
+
+	// Cache directory path for future children
+	if inode.GetType() == types.INodeSection_INode_DIRECTORY {
+		ctx.mu.Lock()
+		ctx.DirPathCache[id] = record.Path
+		ctx.mu.Unlock()
+	}
 
 	// Process details based on type
 	switch inode.GetType() {
@@ -96,58 +206,33 @@ func (img *FSImage) fillINodeRecord(ctx *Pass1Context, record *exporter.INodeRec
 	}
 }
 
-func (img *FSImage) calculatePath(ctx *Pass1Context, id uint64, name string) string {
+func (img *FSImage) getDirPath(ctx *Pass1Context, id uint64) string {
 	if id == RootInodeID {
-		return "/"
+		return "" // Returns empty so child will be "" + "/" + name = "/name"
 	}
 
-	parts := pathSlicePool.Get().([]string)
-	parts = parts[:0]
-	defer func() {
-		pathSlicePool.Put(parts)
-	}()
-
-	if name != "" {
-		parts = append(parts, name)
+	ctx.mu.RLock()
+	p, ok := ctx.DirPathCache[id]
+	ctx.mu.RUnlock()
+	if ok {
+		return p
 	}
 
-	curr := id
-	for {
-		parent, ok := ctx.ChildToParent[curr]
-		if !ok || parent == 0 {
-			break
-		}
-		if parent == RootInodeID {
-			break
-		}
-
-		pName, ok := ctx.IDToName[parent]
-		if ok && pName != "" {
-			parts = append(parts, pName)
-		}
-		curr = parent
+	// If not cached, we need to build it recursively (rare, as children usually come after parents)
+	parentID, ok := ctx.ChildToParent[id]
+	if !ok {
+		return ""
 	}
 
-	if len(parts) == 0 {
-		return "/"
-	}
+	name := ctx.IDToName[id]
+	parentPath := img.getDirPath(ctx, parentID)
+	fullPath := parentPath + "/" + name
 
-	// Calculate total length for pre-allocation
-	totalLen := 1 // Initial /
-	for _, p := range parts {
-		totalLen += len(p) + 1
-	}
+	ctx.mu.Lock()
+	ctx.DirPathCache[id] = fullPath
+	ctx.mu.Unlock()
 
-	var sb strings.Builder
-	sb.Grow(totalLen)
-
-	// Write in reverse order
-	for i := len(parts) - 1; i >= 0; i-- {
-		sb.WriteByte('/')
-		sb.WriteString(parts[i])
-	}
-
-	return sb.String()
+	return fullPath
 }
 
 func (img *FSImage) fillPermission(ctx *Pass1Context, record *exporter.INodeRecord, perm uint64) {
@@ -158,12 +243,37 @@ func (img *FSImage) fillPermission(ctx *Pass1Context, record *exporter.INodeReco
 	// User: bits 40-63
 	uid := uint32((perm >> 40) & 0xFFFFFF)
 
+	record.UserID = uid
+	record.GroupID = gid
+	record.RawPermission = mode
+
 	record.UserName = ctx.StringTable[uid]
 	record.GroupName = ctx.StringTable[gid]
-	record.Permission = formatMode(mode, record.Type == "DIRECTORY")
+	record.Permission = formatMode(mode, record.RawType == uint8(types.INodeSection_INode_DIRECTORY))
 }
 
 func formatMode(mode uint16, isDir bool) string {
+	// Standardize common patterns to avoid allocation
+	if !isDir {
+		switch mode & 0777 {
+		case 0644:
+			return "-rw-r--r--"
+		case 0755:
+			return "-rwxr-xr-x"
+		case 0600:
+			return "-rw-------"
+		}
+	} else {
+		switch mode & 0777 {
+		case 0755:
+			return "drwxr-xr-x"
+		case 0700:
+			return "drwx------"
+		case 0775:
+			return "drwxrwxr-x"
+		}
+	}
+
 	res := make([]byte, 10)
 	if isDir {
 		res[0] = 'd'

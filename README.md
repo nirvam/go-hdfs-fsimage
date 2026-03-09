@@ -42,6 +42,29 @@ make build-rhel8  # 利用 Podman/UBI8 容器化构建
 - [ ] **并发解析尝试**：探索多 Section 并行扫描（如果镜像支持 Section 分片读取），以进一步压榨多核性能。
 - [ ] **多压缩格式支持**：支持 LZ4/Snappy 等 Hadoop 常用压缩算法（当前仅支持 Gzip）。
 
+## Testing
+
+This project includes unit tests, integration tests, and benchmarks.
+
+### Running Tests
+```bash
+# Run all tests
+go test ./...
+
+# Run benchmarks with memory profiling
+go test -v ./pkg/fsimage -run=TestIntegration_RealFSImage -bench=. -benchmem
+```
+
+### Integration Testing with Real FSImage
+To run integration tests against a real HDFS fsimage, place your sample file at:
+`pkg/fsimage/testdata/sample.fsimage`
+
+The tests will automatically detect this file and perform an end-to-end validation. **Note:** Large fsimage files should not be committed to the repository.
+
 ## 开发与贡献
 项目遵循 `PROJECT.md` 中的架构规范。所有代码均需通过 `go test ./...` 验证。
 针对 DuckDB 相关的修改，请务必检查连接泄露问题（已在 `pkg/exporter/duckdb.go` 中提供标准实现参考）。
+
+## License
+
+MIT License. See [LICENSE](LICENSE) for details.

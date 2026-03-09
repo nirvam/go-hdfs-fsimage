@@ -32,6 +32,10 @@ func NewCSVExporter(path string) (*CSVExporter, error) {
 	return &CSVExporter{file: f, writer: w}, nil
 }
 
+func (e *CSVExporter) ExportStringTable(table map[uint32]string) error {
+	return nil
+}
+
 func (e *CSVExporter) Export(record *INodeRecord) error {
 	row := []string{
 		strconv.FormatUint(record.ID, 10),

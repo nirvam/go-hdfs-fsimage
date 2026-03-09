@@ -16,9 +16,13 @@ type INodeRecord struct {
 	BlocksCount        int
 	FileSize           uint64
 	Permission         string // rwxr-xr-x
+	RawPermission      uint16
 	UserName           string
+	UserID             uint32
 	GroupName          string
+	GroupID            uint32
 	Type               string // FILE, DIRECTORY, SYMLINK
+	RawType            uint8  // 1=FILE, 2=DIRECTORY, 3=SYMLINK
 }
 
 var (
@@ -39,13 +43,18 @@ func (r *INodeRecord) Reset() {
 	r.BlocksCount = 0
 	r.FileSize = 0
 	r.Permission = ""
+	r.RawPermission = 0
 	r.UserName = ""
+	r.UserID = 0
 	r.GroupName = ""
+	r.GroupID = 0
 	r.Type = ""
+	r.RawType = 0
 }
 
 // Exporter is the interface for different output formats.
 type Exporter interface {
 	Export(record *INodeRecord) error
+	ExportStringTable(table map[uint32]string) error
 	Close() error
 }
